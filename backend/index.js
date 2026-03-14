@@ -1,28 +1,50 @@
+require('dotenv').config();
+
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'data.sqlite');
 
-const db = new sqlite3.Database(DB_PATH);
+const GAME_TYPES = ['facts', 'pi'];
+const DATABASE_URL = process.env.DATABASE_URL;
 
-db.serialize(() => {
-  db.run(`
-    CREATE TABLE IF NOT EXISTS scores (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      normalized_name TEXT NOT NULL,
-      game_type TEXT NOT NULL CHECK(game_type IN ('facts', 'pi')),
-      score INTEGER NOT NULL,
-      detail TEXT,
-      timestamp TEXT NOT NULL DEFAULT (datetime('now')),
-      UNIQUE(normalized_name, game_type)
-    )
-  `);
+if (!DATABASE_URL) {
+  throw new Error('DATABASE_URL is required. Set it to your PostgreSQL connection string.');
+}
+
+function getSslConfig() {
+  const sslMode = String(process.env.PGSSLMODE || '').toLowerCase();
+  if (sslMode === 'disable') {
+    return false;
+  }
+  if (sslMode === 'require' || process.env.NODE_ENV === 'production') {
+    return { rejectUnauthorized: false };
+  }
+  return false;
+}
+
+const pool = new Pool({
+  connectionString: DATABASE_URL,
+  ssl: getSslConfig()
 });
+
+const schemaSql = `
+  CREATE TABLE IF NOT EXISTS scores (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    normalized_name TEXT NOT NULL,
+    game_type TEXT NOT NULL CHECK (game_type IN ('facts', 'pi')),
+    score INTEGER NOT NULL CHECK (score >= 0),
+    detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(normalized_name, game_type)
+  );
+
+  CREATE INDEX IF NOT EXISTS scores_game_type_score_created_idx
+    ON scores (game_type, score DESC, created_at ASC);
+`;
 
 app.use(cors());
 app.use(express.json());
@@ -31,50 +53,68 @@ function normalizeName(name) {
   return String(name || '').trim().toLowerCase().replace(/\s+/g, ' ');
 }
 
-app.get('/health', (_req, res) => {
-  res.json({ ok: true });
+async function initDb() {
+  await pool.query(schemaSql);
+}
+
+app.get('/health', async (_req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ ok: true });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(500).json({ ok: false, error: 'Database unavailable' });
+  }
 });
 
-app.get('/attempts/check', (req, res) => {
+app.get('/attempts/check', async (req, res) => {
   const { name = '', gameType = '' } = req.query;
   const normalized = normalizeName(name);
 
-  if (!normalized || !['facts', 'pi'].includes(gameType)) {
+  if (!normalized || !GAME_TYPES.includes(gameType)) {
     return res.status(400).json({ error: 'name and valid gameType are required' });
   }
 
-  db.get(
-    'SELECT id FROM scores WHERE normalized_name = ? AND game_type = ?',
-    [normalized, gameType],
-    (err, row) => {
-      if (err) return res.status(500).json({ error: 'Database error' });
-      res.json({ exists: Boolean(row) });
-    }
-  );
+  try {
+    const result = await pool.query(
+      'SELECT id FROM scores WHERE normalized_name = $1 AND game_type = $2',
+      [normalized, gameType]
+    );
+    return res.json({ exists: result.rowCount > 0 });
+  } catch (error) {
+    console.error('Attempt lookup failed:', error);
+    return res.status(500).json({ error: 'Database error' });
+  }
 });
 
-app.get('/scores', (req, res) => {
+app.get('/scores', async (req, res) => {
   const { gameType } = req.query;
-  let sql = 'SELECT id, name, game_type, score, detail, timestamp FROM scores';
+  let sql = `
+    SELECT id, name, game_type, score, detail, created_at AS timestamp
+    FROM scores
+  `;
   const params = [];
 
   if (gameType) {
-    if (!['facts', 'pi'].includes(gameType)) {
+    if (!GAME_TYPES.includes(gameType)) {
       return res.status(400).json({ error: 'Invalid gameType' });
     }
-    sql += ' WHERE game_type = ?';
+    sql += ' WHERE game_type = $1';
     params.push(gameType);
   }
 
-  sql += ' ORDER BY score DESC, timestamp ASC LIMIT 100';
+  sql += ` ORDER BY score DESC, created_at ASC LIMIT 100`;
 
-  db.all(sql, params, (err, rows) => {
-    if (err) return res.status(500).json({ error: 'Database error' });
-    res.json(rows);
-  });
+  try {
+    const result = await pool.query(sql, params);
+    return res.json(result.rows);
+  } catch (error) {
+    console.error('Score lookup failed:', error);
+    return res.status(500).json({ error: 'Database error' });
+  }
 });
 
-app.post('/scores', (req, res) => {
+app.post('/scores', async (req, res) => {
   const { name, gameType, score, detail = null } = req.body || {};
   const normalized = normalizeName(name);
 
@@ -82,7 +122,7 @@ app.post('/scores', (req, res) => {
     return res.status(400).json({ error: 'Name is required' });
   }
 
-  if (!['facts', 'pi'].includes(gameType)) {
+  if (!GAME_TYPES.includes(gameType)) {
     return res.status(400).json({ error: 'Invalid gameType' });
   }
 
@@ -93,28 +133,37 @@ app.post('/scores', (req, res) => {
   const safeDisplayName = String(name).trim().slice(0, 60);
   const safeDetail = detail == null ? null : String(detail).slice(0, 500);
 
-  db.run(
-    `INSERT INTO scores (name, normalized_name, game_type, score, detail)
-     VALUES (?, ?, ?, ?, ?)`,
-    [safeDisplayName, normalized, gameType, score, safeDetail],
-    function onInsert(err) {
-      if (err) {
-        if (String(err.message || '').includes('UNIQUE constraint failed')) {
-          return res.status(409).json({ error: 'This name has already used its attempt for that game.' });
-        }
-        return res.status(500).json({ error: 'Database error' });
-      }
+  try {
+    const result = await pool.query(
+      `INSERT INTO scores (name, normalized_name, game_type, score, detail)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id`,
+      [safeDisplayName, normalized, gameType, score, safeDetail]
+    );
 
-      res.status(201).json({
-        id: this.lastID,
-        name: safeDisplayName,
-        gameType,
-        score
-      });
+    return res.status(201).json({
+      id: result.rows[0].id,
+      name: safeDisplayName,
+      gameType,
+      score
+    });
+  } catch (error) {
+    if (error && error.code === '23505') {
+      return res.status(409).json({ error: 'This name has already used its attempt for that game.' });
     }
-  );
+    console.error('Score insert failed:', error);
+    return res.status(500).json({ error: 'Database error' });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`Mathnasium Pi Day API running on port ${PORT}`);
+async function startServer() {
+  await initDb();
+  app.listen(PORT, () => {
+    console.log(`Mathnasium Pi Day API running on port ${PORT}`);
+  });
+}
+
+startServer().catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
 });
